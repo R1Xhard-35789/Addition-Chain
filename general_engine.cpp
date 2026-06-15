@@ -5,36 +5,61 @@
 #include <sstream>
 #include <omp.h>
 #include <cstdint>
+#include <cstring>
 
 using namespace std;
 
 // ==========================================
 // 1. DATA STRUCTURES & CONSTANTS
 // ==========================================
+// The upgraded Blueprint: 1 byte for length, 160 bytes for the exact sequence
 struct Blueprint {
     uint8_t steps;
-    uint32_t parentA;
-    uint32_t parentB;
+    uint32_t sequence[40]; 
 };
 
 const string LENGTHS_FILE = "master_lengths.bin";
-const string PARENTS_FILE = "master_parents.bin";
+const string SEQUENCES_FILE = "master_sequences.bin"; // Upgraded from parents.bin
 const string LOG_FILE = "verification_log.txt";
 const string OEIS_FILE = "b003313.txt";
 
 // ==========================================
-// 2. FILE I/O & RESUME LOGIC
+// 2. RAM CACHING & FILE I/O
 // ==========================================
+// Loads the entire OEIS text file into RAM once at startup
+vector<uint8_t> load_oeis_cache() {
+    vector<uint8_t> cache(100001, 0); // Pre-allocate up to N=100,000
+    ifstream gold_file(OEIS_FILE);
+    
+    if (gold_file.is_open()) {
+        string line;
+        while (getline(gold_file, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            stringstream ss(line);
+            int n, steps;
+            if (ss >> n >> steps && n <= 100000) {
+                cache[n] = steps;
+            }
+        }
+        cout << "[System] OEIS Database loaded into RAM." << endl;
+    } else {
+        cout << "[Warning] " << OEIS_FILE << " not found. Verification disabled." << endl;
+    }
+    return cache;
+}
+
 int get_resume_target() {
     ifstream infile(LENGTHS_FILE, ios::binary | ios::ate);
     if (!infile.is_open()) {
+        // Initialize lengths file (indices 0 and 1)
         ofstream out_lengths(LENGTHS_FILE, ios::binary);
         uint8_t dummy_len[2] = {0, 0};
         out_lengths.write(reinterpret_cast<char*>(dummy_len), 2);
         
-        ofstream out_parents(PARENTS_FILE, ios::binary);
-        uint32_t dummy_parents[4] = {0, 0, 0, 0}; 
-        out_parents.write(reinterpret_cast<char*>(dummy_parents), 16); 
+        // Initialize sequences file (indices 0 and 1 -> 2 * 40 * 4 bytes)
+        ofstream out_seqs(SEQUENCES_FILE, ios::binary);
+        uint32_t dummy_seqs[80] = {0}; 
+        out_seqs.write(reinterpret_cast<char*>(dummy_seqs), 320); 
         
         return 2; 
     }
@@ -44,79 +69,63 @@ int get_resume_target() {
 
 void append_to_binary(const vector<Blueprint>& chunk) {
     vector<uint8_t> lengths(chunk.size());
-    vector<uint32_t> parents(chunk.size() * 2);
+    vector<uint32_t> sequences(chunk.size() * 40);
 
     for (size_t i = 0; i < chunk.size(); ++i) {
         lengths[i] = chunk[i].steps;
-        parents[i*2] = chunk[i].parentA;
-        parents[i*2 + 1] = chunk[i].parentB;
+        for (int j = 0; j < 40; ++j) {
+            sequences[i * 40 + j] = chunk[i].sequence[j];
+        }
     }
 
     ofstream out_lengths(LENGTHS_FILE, ios::binary | ios::app);
     out_lengths.write(reinterpret_cast<const char*>(lengths.data()), lengths.size());
 
-    ofstream out_parents(PARENTS_FILE, ios::binary | ios::app);
-    out_parents.write(reinterpret_cast<const char*>(parents.data()), parents.size() * sizeof(uint32_t));
+    ofstream out_seqs(SEQUENCES_FILE, ios::binary | ios::app);
+    out_seqs.write(reinterpret_cast<const char*>(sequences.data()), sequences.size() * sizeof(uint32_t));
 }
 
-// Change the function definition to accept the elapsed time
-void verify_and_log(int start_n, int end_n, const vector<Blueprint>& chunk, double elapsed_time) {
+void verify_and_log(int start_n, int end_n, const vector<Blueprint>& chunk, double elapsed_time, const vector<uint8_t>& oeis_cache) {
     ofstream log_file(LOG_FILE, ios::app); 
     
-    // THE 100K FAILSAFE
     if (start_n > 100000) {
-        log_file << "Chunk [" << start_n << " to " << end_n << "] | UNVERIFIED (Exceeds OEIS limit)\n";
+        log_file << "Chunk [" << start_n << " to " << end_n << "] | Time: " << elapsed_time << "s | UNVERIFIED (Exceeds OEIS limit)\n";
         return;
     }
     
-    ifstream gold_file(OEIS_FILE);
     int errors = 0;
     int verified_count = 0;
 
-    if (gold_file.is_open()) {
-        string line;
-        while (getline(gold_file, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            
-            stringstream ss(line);
-            int n, gold_steps;
-            if (!(ss >> n >> gold_steps)) continue;
-
-            if (n < start_n) continue; 
-            if (n > end_n) break;      
-
-            int chunk_index = n - start_n;
-            if (chunk[chunk_index].steps != gold_steps) {
+    for (int i = 0; i < chunk.size(); ++i) {
+        int current_n = start_n + i;
+        if (current_n <= 100000 && oeis_cache[current_n] > 0) {
+            if (chunk[i].steps != oeis_cache[current_n]) {
                 errors++;
             }
             verified_count++;
         }
-    } else {
-        log_file << "WARNING: " << OEIS_FILE << " not found. Skipping verification.\n";
-        return;
     }
 
-    // Add the elapsed_time to the text file output
     log_file << "Chunk [" << start_n << " to " << end_n << "] | Time: " << elapsed_time << "s | ";
-    if (errors == 0) {
+    if (errors == 0 && verified_count > 0) {
         log_file << "SUCCESS (0 Errors out of " << verified_count << " verified)\n";
-    } else {
+    } else if (errors > 0) {
         log_file << "FAILED (" << errors << " Errors detected)\n";
+    } else {
+        log_file << "SKIPPED (No OEIS data in RAM)\n";
     }
 }
 
 // ==========================================
-// 3. THE CORE SEARCH ENGINE (KISS - BRUTE FORCE)
+// 3. THE CORE SEARCH ENGINE
 // ==========================================
 bool search_general_chain(int target, int current_depth, int max_depth, vector<int>& chain) {
     if (chain.back() == target) return true;
     if (current_depth == max_depth) return false;
     
-    // Mathematical pruning: If we double the current number for the rest of the depth 
-    // and still can't hit the target, it's a mathematically dead branch.
+    // Geometric Pruning
     if ((chain.back() << (max_depth - current_depth)) < target) return false;
 
-    // Pure, raw C++ iteration. No sorting, no modulo overhead.
     for (int i = chain.size() - 1; i >= 0; --i) {
         for (int j = i; j >= 0; --j) {
             int next_val = chain[i] + chain[j];
@@ -124,11 +133,9 @@ bool search_general_chain(int target, int current_depth, int max_depth, vector<i
                 chain.push_back(next_val);
                 
                 if (search_general_chain(target, current_depth + 1, max_depth, chain)) {
-                    // We DO NOT pop_back if we find the true chain. 
-                    // This leaves the winning sequence perfectly intact in memory.
                     return true; 
                 }
-                chain.pop_back(); // Only pop if it was a dead end
+                chain.pop_back(); 
             }
         }
     }
@@ -136,7 +143,10 @@ bool search_general_chain(int target, int current_depth, int max_depth, vector<i
 }
 
 Blueprint find_optimal_steps(int target) {
-    Blueprint bp = {0, 0, 0};
+    Blueprint bp;
+    bp.steps = 0;
+    memset(bp.sequence, 0, sizeof(bp.sequence)); // Zero out the array
+    
     if (target <= 1) return bp;
     
     int depth = 0;
@@ -148,17 +158,9 @@ Blueprint find_optimal_steps(int target) {
         if (search_general_chain(target, 0, depth, chain)) {
             bp.steps = (uint8_t)depth;
             
-            // The chain array now holds the winning path!
-            // We just quickly find which two numbers added up to our target.
-            bool found = false;
-            for (size_t i = 0; i < chain.size() - 1 && !found; ++i) {
-                for (size_t j = i; j < chain.size() - 1 && !found; ++j) {
-                    if (chain[i] + chain[j] == target) {
-                        bp.parentA = chain[i];
-                        bp.parentB = chain[j];
-                        found = true;
-                    }
-                }
+            // DIRECT MEMORY COPY: We save the exact path to prevent Prefix-Optimality bugs.
+            for (size_t i = 0; i < chain.size() && i < 40; ++i) {
+                bp.sequence[i] = chain[i];
             }
             return bp;
         }
@@ -170,26 +172,23 @@ Blueprint find_optimal_steps(int target) {
 // 4. MAIN EXECUTION LOOP
 // ==========================================
 int main() {
-    // Lock to exact physical cores to eliminate OS scheduling overhead
     omp_set_num_threads(6); 
 
     cout << "=========================================" << endl;
-    cout << " RELATIONAL GENERAL CHAIN ENGINE STARTED " << endl;
+    cout << " V2 TALLY-TABLE ENGINE STARTED           " << endl;
     cout << "=========================================" << endl;
-    cout << "Press Ctrl+C at any time to safely stop." << endl;
-
+    
+    // Load OEIS to RAM before starting the OpenMP loop
+    vector<uint8_t> oeis_cache = load_oeis_cache();
+    
     int current_n = get_resume_target();
+    cout << "Resuming at N = " << current_n << "\nPress Ctrl+C at any time to safely stop." << endl;
     
     while (true) {
-        // Updated Dynamic Chunk Sizing
         int chunk_size;
-        if (current_n < 20000) {
-            chunk_size = 100;
-        } else if (current_n < 200000) {
-            chunk_size = 10;
-        } else {
-            chunk_size = 1;
-        }
+        if (current_n < 20000) chunk_size = 100;
+        else if (current_n < 200000) chunk_size = 10;
+        else chunk_size = 1;
 
         int end_n = current_n + chunk_size - 1;
         vector<Blueprint> memory_buffer(chunk_size);
@@ -205,14 +204,10 @@ int main() {
         auto end = chrono::high_resolution_clock::now();
         chrono::duration<double> elapsed = end - start;
 
-        // Append results to the dual-file system
         append_to_binary(memory_buffer);
-        
-        // Pass the elapsed time into the verification logger
-        verify_and_log(current_n, end_n, memory_buffer, elapsed.count());
+        verify_and_log(current_n, end_n, memory_buffer, elapsed.count(), oeis_cache);
 
-        cout << " Done in " << elapsed.count() << "s | Logged to txt." << flush;
-
+        cout << " Done in " << elapsed.count() << "s" << flush;
         current_n += chunk_size;
     }
 
