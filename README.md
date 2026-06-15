@@ -3,20 +3,41 @@ C++ engine designed to mine the mathematical ground-truth of Shortest Addition C
 
 Project Philosophy: Empirical Truth
 
-This project prioritizes realistic computation over theoretical shortcuts. By brute-forcing the search space, we identify "Prime Walls" and "Arithmetic Gridlock"—data points where standard mathematical rules deviate from physical reality. These anomalies are archived for further study in number theory and cryptographic vulnerability mapping.
-Technical Architecture
-1. The Engine (general_engine.cpp)
+# Addition Chain Engine
+**STATUS: MAPPING | ACTIVE_GRIND_MODE**
 
-    Logic: Employs parallelized IDDFS to search the addition tree.
+A raw, high-performance C++ engine designed to mine the mathematical ground-truth of Shortest Addition Chains, strictly matching the **OEIS A003313** sequence. 
 
-    Resilience: Features a zero-overhead persistence system. The engine calculates the current registry_limit on startup and seamlessly resumes work, making it suitable for distributed, multi-machine grinds.
+Built for bare-metal execution, this engine utilizes OpenMP dynamic scheduling, mathematical branch-and-bound pruning, and a zero-overhead binary persistence system to brute-force optimal additive paths through the integer number line.
 
-    Performance: Utilizes #pragma omp for multi-threaded dynamic scheduling across physical CPU cores.
+🖥️ **Live Frontend Tracking:** [caring4change.au/tools/ACT.html](https://caring4change.au/tools/ACT.html)
 
-2. The Data Ledger
+---
 
-    master_lengths.bin: Stores the optimal step count for every integer (1 byte per N).
+## ⚡ Core Architecture
 
-    master_parents.bin: Stores the parent indices A and B that produced N (8 bytes per N).
+* **Multi-Threaded Grind:** Hard-locked to physical cores via OpenMP `dynamic` scheduling. This eliminates OS scheduling overhead and handles the highly variable computational depth of "Prime Cliffs" without thread starvation.
+* **Mathematical Pruning:** Employs a look-ahead Depth-First Search (DFS) filter. If the maximum possible geometric progression (doubling the current path's head value) cannot reach the target within the remaining depth allocation, the branch is culled instantly.
+* **Zero-Overhead Dual-File Storage:** State is continuously serialized into pure binary arrays (`master_lengths.bin` and `master_parents.bin`), allowing instant, automated resuming without complex database drivers.
+* **Failsafe Verification:** Automated against the official OEIS sequence up to $N = 100,000$.
 
-    verification_log.txt: An audit trail of compute time and status for every processed batch.
+## 💻 Reference Hardware Benchmark
+
+The development and reference testing environment for this engine uses the following bare-metal configuration:
+
+| Component | Specification |
+| :--- | :--- |
+| **Device Name** | r1x |
+| **Processor** | AMD Ryzen 5 8500G (3.55 GHz, 6 Physical Cores / 12 Threads) |
+| **Memory** | 16.0 GB RAM (15.1 GB usable) |
+| **Graphics** | AMD Radeon 740M Graphics |
+| **OS** | Windows / Architecture: x64 |
+
+## 📖 Documentation Directory
+
+* **[USAGE.md](USAGE.md):** Full instructions for compiling the C++ engine, tuning threads, and using the Python query script to unpack the binary data.
+* **[ABOUT.md](ABOUT.md):** A deeper dive into the algorithmic philosophy, the "Prime Cliff" problem, and why this engine relies on geometric limits rather than algebraic guessing.
+
+## ⚖️ License
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**. 
+You are free to use, modify, and distribute this software, provided that any derivative works are also made open-source under the same GPLv3 terms. Kudos and credit to the original repository are appreciated!
