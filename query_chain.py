@@ -5,39 +5,36 @@ import os
 
 def get_chain(target):
     LEN_FILE = "master_lengths.bin"
-    PAR_FILE = "master_parents.bin"
+    SEQ_FILE = "master_sequences.bin"
 
-    if not os.path.exists(LEN_FILE) or not os.path.exists(PAR_FILE):
+    if not os.path.exists(LEN_FILE) or not os.path.exists(SEQ_FILE):
         return {"error": "Database files missing."}
 
     max_indexed = os.path.getsize(LEN_FILE) - 1
     if target > max_indexed or target < 2:
         return {"error": f"Target {target} exceeds indexed registry limit ({max_indexed})."}
 
-    with open(LEN_FILE, "rb") as f_len, open(PAR_FILE, "rb") as f_par:
+    with open(LEN_FILE, "rb") as f_len, open(SEQ_FILE, "rb") as f_seq:
+        # 1. Get length
         f_len.seek(target)
         steps = struct.unpack("B", f_len.read(1))[0]
 
-        chain_set = {1}
+        # 2. Get the exact sequence array
+        # Offset: 2 dummy numbers * 160 bytes = 320 byte header. Then target * 160.
+        offset = target * 160
+        f_seq.seek(offset)
         
-        def trace_parents(n):
-            if n <= 1: return
-            offset = 16 + (n - 2) * 8
-            f_par.seek(offset)
-            pA, pB = struct.unpack("<II", f_par.read(8))
-            chain_set.add(n)
-            if pA > 1 and pA not in chain_set: trace_parents(pA)
-            if pB > 1 and pB not in chain_set: trace_parents(pB)
+        # Read 40 uint32_t integers
+        raw_data = f_seq.read(160)
+        sequence_array = struct.unpack("<40I", raw_data)
+        
+        # Filter out the zero-padding
+        clean_chain = [str(x) for x in sequence_array if x != 0]
 
-        trace_parents(target)
-        
-        full_chain = sorted(list(chain_set))
-        ancestors = [str(x) for x in full_chain if x != target]
-        
         return {
             "target": target,
             "optimal_steps": steps,
-            "synthesis": " → ".join(ancestors),
+            "synthesis": " → ".join(clean_chain),
             "registry_limit": max_indexed
         }
 
