@@ -12,23 +12,31 @@ using namespace std;
 // ==========================================
 // 1. DATA STRUCTURES & CONSTANTS
 // ==========================================
-// The upgraded Blueprint: 1 byte for length, 160 bytes for the exact sequence
-struct Blueprint {
-    uint8_t steps;
-    uint32_t sequence[40]; 
+// The 32-Bit Atomic Ledger Entry
+struct PackedBlueprint {
+    uint32_t data;
 };
 
-const string LENGTHS_FILE = "master_lengths.bin";
-const string SEQUENCES_FILE = "master_sequences.bin"; // Upgraded from parents.bin
+const string LEDGER_FILE = "master_ledger.bin";
 const string LOG_FILE = "verification_log.txt";
 const string OEIS_FILE = "b003313.txt";
+
+// Fast Primality Test for the Flag
+bool is_prime_n(uint32_t n) {
+    if (n < 2) return false;
+    if (n == 2 || n == 3) return true;
+    if (n % 2 == 0 || n % 3 == 0) return false;
+    for (uint32_t i = 5; i * i <= n; i += 6) {
+        if (n % i == 0 || n % (i + 2) == 0) return false;
+    }
+    return true;
+}
 
 // ==========================================
 // 2. RAM CACHING & FILE I/O
 // ==========================================
-// Loads the entire OEIS text file into RAM once at startup
 vector<uint8_t> load_oeis_cache() {
-    vector<uint8_t> cache(100001, 0); // Pre-allocate up to N=100,000
+    vector<uint8_t> cache(100001, 0); 
     ifstream gold_file(OEIS_FILE);
     
     if (gold_file.is_open()) {
@@ -49,43 +57,24 @@ vector<uint8_t> load_oeis_cache() {
 }
 
 int get_resume_target() {
-    ifstream infile(LENGTHS_FILE, ios::binary | ios::ate);
+    ifstream infile(LEDGER_FILE, ios::binary | ios::ate);
     if (!infile.is_open()) {
-        // Initialize lengths file (indices 0 and 1)
-        ofstream out_lengths(LENGTHS_FILE, ios::binary);
-        uint8_t dummy_len[2] = {0, 0};
-        out_lengths.write(reinterpret_cast<char*>(dummy_len), 2);
-        
-        // Initialize sequences file (indices 0 and 1 -> 2 * 40 * 4 bytes)
-        ofstream out_seqs(SEQUENCES_FILE, ios::binary);
-        uint32_t dummy_seqs[80] = {0}; 
-        out_seqs.write(reinterpret_cast<char*>(dummy_seqs), 320); 
-        
-        return 2; 
+        // Initialize ledger with N=0 and N=1 (8 bytes total)
+        ofstream out_ledger(LEDGER_FILE, ios::binary);
+        uint32_t dummies[2] = {0, 0};
+        out_ledger.write(reinterpret_cast<char*>(dummies), 8);
+        return 2;
     }
-    // The byte size of the 1-byte lengths file equals the total numbers processed!
-    return infile.tellg(); 
+    // File size divided by 4 bytes gives the exact N
+    return infile.tellg() / sizeof(uint32_t); 
 }
 
-void append_to_binary(const vector<Blueprint>& chunk) {
-    vector<uint8_t> lengths(chunk.size());
-    vector<uint32_t> sequences(chunk.size() * 40);
-
-    for (size_t i = 0; i < chunk.size(); ++i) {
-        lengths[i] = chunk[i].steps;
-        for (int j = 0; j < 40; ++j) {
-            sequences[i * 40 + j] = chunk[i].sequence[j];
-        }
-    }
-
-    ofstream out_lengths(LENGTHS_FILE, ios::binary | ios::app);
-    out_lengths.write(reinterpret_cast<const char*>(lengths.data()), lengths.size());
-
-    ofstream out_seqs(SEQUENCES_FILE, ios::binary | ios::app);
-    out_seqs.write(reinterpret_cast<const char*>(sequences.data()), sequences.size() * sizeof(uint32_t));
+void append_to_binary(const vector<PackedBlueprint>& chunk) {
+    ofstream out_ledger(LEDGER_FILE, ios::binary | ios::app);
+    out_ledger.write(reinterpret_cast<const char*>(chunk.data()), chunk.size() * sizeof(PackedBlueprint));
 }
 
-void verify_and_log(int start_n, int end_n, const vector<Blueprint>& chunk, double elapsed_time, const vector<uint8_t>& oeis_cache) {
+void verify_and_log(int start_n, int end_n, const vector<PackedBlueprint>& chunk, double elapsed_time, const vector<uint8_t>& oeis_cache) {
     ofstream log_file(LOG_FILE, ios::app); 
     
     if (start_n > 100000) {
@@ -96,10 +85,12 @@ void verify_and_log(int start_n, int end_n, const vector<Blueprint>& chunk, doub
     int errors = 0;
     int verified_count = 0;
 
-    for (int i = 0; i < chunk.size(); ++i) {
+    for (size_t i = 0; i < chunk.size(); ++i) {
         int current_n = start_n + i;
         if (current_n <= 100000 && oeis_cache[current_n] > 0) {
-            if (chunk[i].steps != oeis_cache[current_n]) {
+            // Unpack just the step count (bottom 7 bits) to verify
+            uint8_t steps = chunk[i].data & 0x7F;
+            if (steps != oeis_cache[current_n]) {
                 errors++;
             }
             verified_count++;
@@ -123,7 +114,6 @@ bool search_general_chain(int target, int current_depth, int max_depth, vector<i
     if (chain.back() == target) return true;
     if (current_depth == max_depth) return false;
     
-    // Geometric Pruning
     if ((chain.back() << (max_depth - current_depth)) < target) return false;
 
     for (int i = chain.size() - 1; i >= 0; --i) {
@@ -142,30 +132,78 @@ bool search_general_chain(int target, int current_depth, int max_depth, vector<i
     return false;
 }
 
-Blueprint find_optimal_steps(int target) {
-    Blueprint bp;
-    bp.steps = 0;
-    memset(bp.sequence, 0, sizeof(bp.sequence)); // Zero out the array
-    
-    if (target <= 1) return bp;
+PackedBlueprint find_optimal_steps(int target) {
+    if (target <= 1) return {0};
     
     int depth = 0;
     int temp = target;
     while (temp > 1) { depth++; temp /= 2; }
 
+    vector<int> final_chain;
+    
+    // 1. Run the Grind
     while (true) {
         vector<int> chain = {1};
         if (search_general_chain(target, 0, depth, chain)) {
-            bp.steps = (uint8_t)depth;
-            
-            // DIRECT MEMORY COPY: We save the exact path to prevent Prefix-Optimality bugs.
-            for (size_t i = 0; i < chain.size() && i < 40; ++i) {
-                bp.sequence[i] = chain[i];
-            }
-            return bp;
+            final_chain = chain;
+            break;
         }
         depth++;
     }
+
+    // 2. Mathematically Deduce the Parents
+    uint32_t parentA = 1;
+    uint32_t parentB = 1;
+    bool is_non_star = true;
+
+    if (final_chain.size() >= 2) {
+        uint32_t immediate_pred = final_chain[final_chain.size() - 2];
+        uint32_t needed_b = target - immediate_pred;
+
+        // Check if it's a standard Star Step
+        for (int x : final_chain) {
+            if (x == needed_b) {
+                parentA = immediate_pred;
+                parentB = needed_b;
+                is_non_star = false;
+                break;
+            }
+        }
+
+        // If not a star step, deep-search the chain for the rare parent combo
+        if (is_non_star) {
+            bool found = false;
+            for (int i = final_chain.size() - 2; i >= 0; --i) {
+                for (int j = i; j >= 0; --j) {
+                    if (final_chain[i] + final_chain[j] == target) {
+                        parentA = final_chain[i];
+                        parentB = final_chain[j];
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) break;
+            }
+            if (!found) { // Safety fallback
+                parentA = immediate_pred;
+                parentB = target - immediate_pred;
+            }
+        }
+    }
+
+    // 3. Set the 4 Metadata Flags
+    uint8_t flags = 0;
+    if (parentA == parentB) flags |= (1 << 0); // Bit 0: Doubling
+    if (parentB == 1) flags |= (1 << 1);       // Bit 1: Small Step
+    if (is_prime_n(target)) flags |= (1 << 2); // Bit 2: Prime
+    if (is_non_star) flags |= (1 << 3);        // Bit 3: Non-Star Anomaly
+
+    // 4. Pack into 32-bit Architecture
+    // 7 bits (steps) | 4 bits (flags) | 21 bits (ParentA)
+    uint8_t steps = (uint8_t)depth;
+    uint32_t encoded = (steps & 0x7F) | ((flags & 0x0F) << 7) | ((parentA & 0x1FFFFF) << 11);
+    
+    return { encoded };
 }
 
 // ==========================================
@@ -175,10 +213,9 @@ int main() {
     omp_set_num_threads(6); 
 
     cout << "=========================================" << endl;
-    cout << " V2 TALLY-TABLE ENGINE STARTED           " << endl;
+    cout << " 32-BIT ATOMIC ENGINE STARTED            " << endl;
     cout << "=========================================" << endl;
     
-    // Load OEIS to RAM before starting the OpenMP loop
     vector<uint8_t> oeis_cache = load_oeis_cache();
     
     int current_n = get_resume_target();
@@ -191,7 +228,7 @@ int main() {
         else chunk_size = 1;
 
         int end_n = current_n + chunk_size - 1;
-        vector<Blueprint> memory_buffer(chunk_size);
+        vector<PackedBlueprint> memory_buffer(chunk_size);
 
         cout << "\nProcessing N=" << current_n << " to " << end_n << "..." << flush;
         auto start = chrono::high_resolution_clock::now();
@@ -204,7 +241,10 @@ int main() {
         auto end = chrono::high_resolution_clock::now();
         chrono::duration<double> elapsed = end - start;
 
+        // Atomic write
         append_to_binary(memory_buffer);
+        
+        // Log and Verify against OEIS
         verify_and_log(current_n, end_n, memory_buffer, elapsed.count(), oeis_cache);
 
         cout << " Done in " << elapsed.count() << "s" << flush;
