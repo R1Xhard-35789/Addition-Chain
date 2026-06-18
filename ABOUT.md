@@ -17,17 +17,19 @@ Our engine uses Iterative Deepening Depth-First Search (IDDFS) with strict geome
 The Atomic Binary Ledger
 
 To handle the massive scale of this data, we moved away from fragile, text-based arrays toward a 32-bit Atomic Packed Architecture.
-The 32-Bit Master Stamp
+🛠️ The 32-Bit Atomic Master Stamp (Updated: 22-Bit Delta Mode)
 
-Every integer in our database is mapped to a single, contiguous 4-byte (32-bit) block in master_ledger.bin. This architecture is "Atomic"—it cannot be fractured by thread crashes or interrupted file writes.
+Every integer is mapped to a contiguous 4-byte (32-bit) atomic block in master_ledger.bin. The engine employs a "Folded Ruler" delta codec to map addition chains up to N = 8,388,606 without sacrificing storage efficiency.
 Bit Range	Size	Purpose	Description
-0–6	7 bits	Steps	Stores the absolute minimum step count (max 127).
-7–10	4 bits	Flags	Metadata markers for Primality, Doubling, and Non-Star anomalies.
-11–31	21 bits	Payload	Stores the immediate parent index, allowing for N up to 2,097,151.
-Why this changes everything:
+0–5	6 bits	Steps	Absolute minimum chain length (optimized for N up to 8.38M).
+6–9	4 bits	Flags	Metadata markers: Primality, Doubling, Star/Non-Star status.
+10–31	22 bits	Payload	Stores the Delta (N−parentA), allowing for deep mapping.
+Why this architecture changes everything:
 
-    Zero-Overhead: By removing padding and zero-filled arrays, the database size is reduced by over 97%.
+    Geometric Compression: By storing the distance (Delta) rather than the absolute parentA, we bypass the 21-bit hard ceiling, doubling our addressable number line while remaining fully coupled within a 32-bit word.
 
-    Instant Seeking: Because every record is exactly 4 bytes, finding the path for any number N is a simple seek(N * 4) operation. This allows our visualization tools to pull data in microseconds.
+    Instant Seeking: With a fixed 4-byte record size, finding the geodesic path for any target N is a constant-time O(1) memory operation, seek(N * 4).
 
-    Data Integrity: The "File-Slide" corruption common in legacy systems is impossible here. Every write is a single, uninterruptible hardware operation.
+    Zero-Copy Logic: The JavaScript visualizer can perform bit-shifts directly on the raw buffer, rendering ancestry paths without needing to "parse" complex JSON or string objects.
+
+The "Non-Star" Anomaly: Standard addition chain heuristics (like the Binary Method) rely on "Star Chains," where each step must use the immediately preceding value. Our engine actively searches for "Non-Star" chains, which deviate from this rule. By mapping these anomalies, we are uncovering the computational "dark matter" of addition chains—paths that are mathematically shorter but hidden from traditional algebraic approaches.
