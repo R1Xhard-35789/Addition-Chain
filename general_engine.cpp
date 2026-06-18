@@ -21,6 +21,11 @@ const string LEDGER_FILE = "master_ledger.bin";
 const string LOG_FILE = "verification_log.txt";
 const string OEIS_FILE = "b003313.txt";
 
+// Absolute maximum target based on a 22-bit Delta. 
+// Max 22-bit value is 4,194,303. Since Delta = N - parentA, and parentA >= N/2, 
+// the maximum safe N is 2 * 4,194,303 = 8,388,606.
+const int MAX_SUPPORTED_N = 8388606; 
+
 // Fast Primality Test for the Flag
 bool is_prime_n(uint32_t n) {
     if (n < 2) return false;
@@ -83,6 +88,7 @@ void append_to_binary(const vector<PackedBlueprint>& chunk, const string& filena
     ofstream out_ledger(filename, ios::binary | ios::app);
     out_ledger.write(reinterpret_cast<const char*>(chunk.data()), chunk.size() * sizeof(PackedBlueprint));
 }
+
 void verify_and_log(int start_n, int end_n, const vector<PackedBlueprint>& chunk, double elapsed_time, const vector<uint8_t>& oeis_cache) {
     ofstream log_file(LOG_FILE, ios::app); 
     
@@ -97,8 +103,8 @@ void verify_and_log(int start_n, int end_n, const vector<PackedBlueprint>& chunk
     for (size_t i = 0; i < chunk.size(); ++i) {
         int current_n = start_n + i;
         if (current_n <= 100000 && oeis_cache[current_n] > 0) {
-            // Unpack just the step count (bottom 7 bits) to verify
-            uint8_t steps = chunk[i].data & 0x7F;
+            // Unpack just the step count (bottom 6 bits now!) to verify
+            uint8_t steps = chunk[i].data & 0x3F;
             if (steps != oeis_cache[current_n]) {
                 errors++;
             }
@@ -207,10 +213,20 @@ PackedBlueprint find_optimal_steps(int target) {
     if (is_prime_n(target)) flags |= (1 << 2); // Bit 2: Prime
     if (is_non_star) flags |= (1 << 3);        // Bit 3: Non-Star Anomaly
 
-    // 4. Pack into 32-bit Architecture
-    // 7 bits (steps) | 4 bits (flags) | 21 bits (ParentA)
+    // 4. Pack into 32-bit Architecture using the 22-bit Delta method
+    uint32_t delta = target - parentA;
+
+    // Hard Safety Check to ensure the delta never overflows 22 bits
+    if (delta > 0x3FFFFF) {
+        #pragma omp critical
+        cout << "\n[CRITICAL WARNING] 22-Bit Delta Overflow at N=" << target << "! Value corrupted." << endl;
+    }
+
+    // 6 bits (steps) | 4 bits (flags) | 22 bits (Delta)
     uint8_t steps = (uint8_t)depth;
-    uint32_t encoded = (steps & 0x7F) | ((flags & 0x0F) << 7) | ((parentA & 0x1FFFFF) << 11);
+    
+    // Steps takes 6 bits (0x3F), Flags shift by 6, Delta shifts by 10 (6+4)
+    uint32_t encoded = (steps & 0x3F) | ((flags & 0x0F) << 6) | ((delta & 0x3FFFFF) << 10);
     
     return { encoded };
 }
@@ -223,6 +239,7 @@ int main(int argc, char* argv[]) {
 
     cout << "=========================================" << endl;
     cout << " 32-BIT ATOMIC ENGINE STARTED            " << endl;
+    cout << " 22-BIT DELTA MODE | MAX LIMIT: 8,388,606" << endl;
     cout << "=========================================" << endl;
     
     vector<uint8_t> oeis_cache = load_oeis_cache();
@@ -237,7 +254,6 @@ int main(int argc, char* argv[]) {
         end_limit = stoi(argv[2]);
         active_file = "chunk_" + to_string(requested_start) + "_" + to_string(end_limit) + ".bin";
         
-        // Calculate exact resume point for this specific chunk
         current_n = get_resume_target(active_file, requested_start);
         
         cout << "[DISTRIBUTED MODE] Target Range: " << requested_start << " to " << end_limit << endl;
@@ -250,6 +266,16 @@ int main(int argc, char* argv[]) {
         cout << "Resuming at N = " << current_n << "\nPress Ctrl+C at any time to safely stop." << endl;
     }
 
+    // Safety checks against the architectural limit
+    if (current_n > MAX_SUPPORTED_N) {
+        cout << "[ABORT] System has reached max 22-Bit Delta capacity (" << MAX_SUPPORTED_N << ")." << endl;
+        return 0;
+    }
+    if (end_limit != -1 && end_limit > MAX_SUPPORTED_N) {
+        cout << "[WARNING] End limit adjusted to safe architecture maximum: " << MAX_SUPPORTED_N << endl;
+        end_limit = MAX_SUPPORTED_N;
+    }
+
     if (end_limit != -1 && current_n > end_limit) {
         cout << "\n[COMPLETED] This chunk has already reached its target limit." << endl;
         return 0;
@@ -257,13 +283,19 @@ int main(int argc, char* argv[]) {
     
     while (true) {
         int chunk_size;
+        // Adjusted batch sizing to hit batches of 6 threads exactly when it gets hard
         if (current_n < 20000) chunk_size = 100;
-        else if (current_n < 200000) chunk_size = 10;
-        else chunk_size = 1;
+        else if (current_n < 30000) chunk_size = 10;
+        else chunk_size = 6;
 
         // Ensure we don't overshoot the end limit in Distributed Mode
         if (end_limit != -1 && (current_n + chunk_size - 1) > end_limit) {
             chunk_size = (end_limit - current_n) + 1;
+        }
+
+        // Ensure we don't overshoot the absolute architecture limit
+        if (current_n + chunk_size - 1 > MAX_SUPPORTED_N) {
+            chunk_size = (MAX_SUPPORTED_N - current_n) + 1;
         }
 
         int end_n = current_n + chunk_size - 1;
@@ -292,6 +324,12 @@ int main(int argc, char* argv[]) {
         // Stop the engine if we hit the chunk limit
         if (end_limit != -1 && current_n > end_limit) {
             cout << "\n\n[CHUNK COMPLETE] Node has successfully mapped " << argv[1] << " to " << end_limit << "." << endl;
+            break;
+        }
+        
+        // Final safety exit if ceiling is reached
+        if (current_n > MAX_SUPPORTED_N) {
+            cout << "\n\n[SYSTEM LIMIT REACHED] Reached N=" << MAX_SUPPORTED_N << ". Architecture limit reached." << endl;
             break;
         }
     }
