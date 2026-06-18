@@ -56,24 +56,33 @@ vector<uint8_t> load_oeis_cache() {
     return cache;
 }
 
-int get_resume_target() {
-    ifstream infile(LEDGER_FILE, ios::binary | ios::ate);
+// UPDATED: Now accepts a dynamic filename
+int get_resume_target(const string& filename, int base_start = 2) {
+    ifstream infile(filename, ios::binary | ios::ate);
     if (!infile.is_open()) {
-        // Initialize ledger with N=0 and N=1 (8 bytes total)
-        ofstream out_ledger(LEDGER_FILE, ios::binary);
-        uint32_t dummies[2] = {0, 0};
-        out_ledger.write(reinterpret_cast<char*>(dummies), 8);
-        return 2;
+        ofstream out_ledger(filename, ios::binary);
+        // If this is the master ledger (base_start == 2), write the N=0 and N=1 dummy bytes
+        if (base_start == 2) {
+            uint32_t dummies[2] = {0, 0};
+            out_ledger.write(reinterpret_cast<char*>(dummies), 8);
+        }
+        return base_start;
     }
-    // File size divided by 4 bytes gives the exact N
-    return infile.tellg() / sizeof(uint32_t); 
+    // Calculate how many integers are already in this specific file
+    int mapped_count = infile.tellg() / sizeof(uint32_t); 
+    
+    // If it's a chunk, it doesn't have the N=0/1 offset, so we just add the count to the base start
+    if (base_start > 2) {
+        return base_start + mapped_count;
+    }
+    return mapped_count; 
 }
 
-void append_to_binary(const vector<PackedBlueprint>& chunk) {
-    ofstream out_ledger(LEDGER_FILE, ios::binary | ios::app);
+// UPDATED: Now accepts a dynamic filename
+void append_to_binary(const vector<PackedBlueprint>& chunk, const string& filename) {
+    ofstream out_ledger(filename, ios::binary | ios::app);
     out_ledger.write(reinterpret_cast<const char*>(chunk.data()), chunk.size() * sizeof(PackedBlueprint));
 }
-
 void verify_and_log(int start_n, int end_n, const vector<PackedBlueprint>& chunk, double elapsed_time, const vector<uint8_t>& oeis_cache) {
     ofstream log_file(LOG_FILE, ios::app); 
     
@@ -209,7 +218,7 @@ PackedBlueprint find_optimal_steps(int target) {
 // ==========================================
 // 4. MAIN EXECUTION LOOP
 // ==========================================
-int main() {
+int main(int argc, char* argv[]) {
     omp_set_num_threads(6); 
 
     cout << "=========================================" << endl;
@@ -218,14 +227,44 @@ int main() {
     
     vector<uint8_t> oeis_cache = load_oeis_cache();
     
-    int current_n = get_resume_target();
-    cout << "Resuming at N = " << current_n << "\nPress Ctrl+C at any time to safely stop." << endl;
+    int current_n;
+    int end_limit = -1;
+    string active_file = LEDGER_FILE;
+
+    // CLI ARGUMENT PARSING
+    if (argc == 3) {
+        int requested_start = stoi(argv[1]);
+        end_limit = stoi(argv[2]);
+        active_file = "chunk_" + to_string(requested_start) + "_" + to_string(end_limit) + ".bin";
+        
+        // Calculate exact resume point for this specific chunk
+        current_n = get_resume_target(active_file, requested_start);
+        
+        cout << "[DISTRIBUTED MODE] Target Range: " << requested_start << " to " << end_limit << endl;
+        cout << "[!] Saving isolated payload to: " << active_file << endl;
+        cout << "Resuming chunk at N = " << current_n << endl;
+        
+    } else {
+        current_n = get_resume_target(active_file, 2);
+        cout << "[STANDARD MODE] Active Ledger: " << active_file << endl;
+        cout << "Resuming at N = " << current_n << "\nPress Ctrl+C at any time to safely stop." << endl;
+    }
+
+    if (end_limit != -1 && current_n > end_limit) {
+        cout << "\n[COMPLETED] This chunk has already reached its target limit." << endl;
+        return 0;
+    }
     
     while (true) {
         int chunk_size;
         if (current_n < 20000) chunk_size = 100;
         else if (current_n < 200000) chunk_size = 10;
         else chunk_size = 1;
+
+        // Ensure we don't overshoot the end limit in Distributed Mode
+        if (end_limit != -1 && (current_n + chunk_size - 1) > end_limit) {
+            chunk_size = (end_limit - current_n) + 1;
+        }
 
         int end_n = current_n + chunk_size - 1;
         vector<PackedBlueprint> memory_buffer(chunk_size);
@@ -241,14 +280,20 @@ int main() {
         auto end = chrono::high_resolution_clock::now();
         chrono::duration<double> elapsed = end - start;
 
-        // Atomic write
-        append_to_binary(memory_buffer);
+        // Atomic write to whichever file is active (master or chunk)
+        append_to_binary(memory_buffer, active_file);
         
         // Log and Verify against OEIS
         verify_and_log(current_n, end_n, memory_buffer, elapsed.count(), oeis_cache);
 
         cout << " Done in " << elapsed.count() << "s" << flush;
         current_n += chunk_size;
+
+        // Stop the engine if we hit the chunk limit
+        if (end_limit != -1 && current_n > end_limit) {
+            cout << "\n\n[CHUNK COMPLETE] Node has successfully mapped " << argv[1] << " to " << end_limit << "." << endl;
+            break;
+        }
     }
 
     return 0;
