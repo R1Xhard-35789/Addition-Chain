@@ -1,32 +1,29 @@
 #include <iostream>
 #include <vector>
-#include <chrono>
 #include <fstream>
-#include <sstream>
-#include <omp.h>
+#include <cmath>
 #include <cstdint>
-#include <cstring>
+#include <chrono>
+#include <csignal>
+#include <omp.h>
+#include <iomanip>
 
 using namespace std;
 
 // ==========================================
-// 1. DATA STRUCTURES & CONSTANTS
+// 1. CONFIGURATION
 // ==========================================
-// The 32-Bit Atomic Ledger Entry
-struct PackedBlueprint {
-    uint32_t data;
-};
+const string FILE_INDEX = "chain_index.bin";
+const string FILE_BLOB  = "chain_blob.bin";
+const int RUN_LIMIT     = 100000;
+const int FLUSH_CHUNK   = 120; // Multiple of 6 for clean batching
 
-const string LEDGER_FILE = "master_ledger.bin";
-const string LOG_FILE = "verification_log.txt";
-const string OEIS_FILE = "b003313.txt";
+volatile sig_atomic_t keep_running = 1;
+void sig_handler(int signum) { keep_running = 0; }
 
-// Absolute maximum target based on a 22-bit Delta. 
-// Max 22-bit value is 4,194,303. Since Delta = N - parentA, and parentA >= N/2, 
-// the maximum safe N is 2 * 4,194,303 = 8,388,606.
-const int MAX_SUPPORTED_N = 8388606; 
-
-// Fast Primality Test for the Flag
+// ==========================================
+// 2. ANALYZER & MATH HELPERS
+// ==========================================
 bool is_prime_n(uint32_t n) {
     if (n < 2) return false;
     if (n == 2 || n == 3) return true;
@@ -37,109 +34,39 @@ bool is_prime_n(uint32_t n) {
     return true;
 }
 
-// ==========================================
-// 2. RAM CACHING & FILE I/O
-// ==========================================
-vector<uint8_t> load_oeis_cache() {
-    vector<uint8_t> cache(100001, 0); 
-    ifstream gold_file(OEIS_FILE);
+uint16_t calculate_enrichment_mask(uint32_t target_n, const vector<uint32_t>& chain) {
+    uint16_t mask = 0;
     
-    if (gold_file.is_open()) {
-        string line;
-        while (getline(gold_file, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            stringstream ss(line);
-            int n, steps;
-            if (ss >> n >> steps && n <= 100000) {
-                cache[n] = steps;
-            }
-        }
-        cout << "[System] OEIS Database loaded into RAM." << endl;
-    } else {
-        cout << "[Warning] " << OEIS_FILE << " not found. Verification disabled." << endl;
-    }
-    return cache;
-}
-
-// UPDATED: Now accepts a dynamic filename
-int get_resume_target(const string& filename, int base_start = 2) {
-    ifstream infile(filename, ios::binary | ios::ate);
-    if (!infile.is_open()) {
-        ofstream out_ledger(filename, ios::binary);
-        // If this is the master ledger (base_start == 2), write the N=0 and N=1 dummy bytes
-        if (base_start == 2) {
-            uint32_t dummies[2] = {0, 0};
-            out_ledger.write(reinterpret_cast<char*>(dummies), 8);
-        }
-        return base_start;
-    }
-    // Calculate how many integers are already in this specific file
-    int mapped_count = infile.tellg() / sizeof(uint32_t); 
+    // Bit 0: Is Prime
+    if (is_prime_n(target_n)) mask |= (1 << 0);
     
-    // If it's a chunk, it doesn't have the N=0/1 offset, so we just add the count to the base start
-    if (base_start > 2) {
-        return base_start + mapped_count;
-    }
-    return mapped_count; 
-}
-
-// UPDATED: Now accepts a dynamic filename
-void append_to_binary(const vector<PackedBlueprint>& chunk, const string& filename) {
-    ofstream out_ledger(filename, ios::binary | ios::app);
-    out_ledger.write(reinterpret_cast<const char*>(chunk.data()), chunk.size() * sizeof(PackedBlueprint));
-}
-
-void verify_and_log(int start_n, int end_n, const vector<PackedBlueprint>& chunk, double elapsed_time, const vector<uint8_t>& oeis_cache) {
-    ofstream log_file(LOG_FILE, ios::app); 
+    // Bit 1: Is Safe Prime (Prime Double)
+    if (is_prime_n(target_n) && is_prime_n((target_n - 1) / 2)) mask |= (1 << 1);
     
-    if (start_n > 100000) {
-        log_file << "Chunk [" << start_n << " to " << end_n << "] | Time: " << elapsed_time << "s | UNVERIFIED (Exceeds OEIS limit)\n";
-        return;
-    }
-    
-    int errors = 0;
-    int verified_count = 0;
+    // Bit 2: High Hamming Weight (More 1s than 0s)
+    int bit_length = (int)std::log2((double)target_n) + 1;
+    if (__builtin_popcount(target_n) > bit_length / 2) mask |= (1 << 2);
 
-    for (size_t i = 0; i < chunk.size(); ++i) {
-        int current_n = start_n + i;
-        if (current_n <= 100000 && oeis_cache[current_n] > 0) {
-            // Unpack just the step count (bottom 6 bits now!) to verify
-            uint8_t steps = chunk[i].data & 0x3F;
-            if (steps != oeis_cache[current_n]) {
-                errors++;
-            }
-            verified_count++;
-        }
-    }
-
-    log_file << "Chunk [" << start_n << " to " << end_n << "] | Time: " << elapsed_time << "s | ";
-    if (errors == 0 && verified_count > 0) {
-        log_file << "SUCCESS (0 Errors out of " << verified_count << " verified)\n";
-    } else if (errors > 0) {
-        log_file << "FAILED (" << errors << " Errors detected)\n";
-    } else {
-        log_file << "SKIPPED (No OEIS data in RAM)\n";
-    }
+    return mask;
 }
 
 // ==========================================
-// 3. THE CORE SEARCH ENGINE
+// 3. FAST-BREAK IDDFS SEARCH
 // ==========================================
-bool search_general_chain(int target, int current_depth, int max_depth, vector<int>& chain) {
-    if (chain.back() == target) return true;
+bool search_chain(int target, int current_depth, int max_depth, vector<uint32_t>& chain, vector<uint32_t>& best_chain) {
+    if (chain.back() == target) {
+        best_chain = chain;
+        return true; 
+    }
     if (current_depth == max_depth) return false;
-    
     if ((chain.back() << (max_depth - current_depth)) < target) return false;
 
     for (int i = chain.size() - 1; i >= 0; --i) {
         for (int j = i; j >= 0; --j) {
-            int next_val = chain[i] + chain[j];
+            uint32_t next_val = chain[i] + chain[j];
             if (next_val > chain.back() && next_val <= target) {
                 chain.push_back(next_val);
-                
-                if (search_general_chain(target, current_depth + 1, max_depth, chain)) {
-                    return true; 
-                }
+                if (search_chain(target, current_depth + 1, max_depth, chain, best_chain)) return true;
                 chain.pop_back(); 
             }
         }
@@ -147,192 +74,133 @@ bool search_general_chain(int target, int current_depth, int max_depth, vector<i
     return false;
 }
 
-PackedBlueprint find_optimal_steps(int target) {
-    if (target <= 1) return {0};
+vector<uint32_t> solve_n(uint32_t target_n) {
+    vector<uint32_t> best_chain;
+    int target_depth = (int)std::ceil(std::log2((double)target_n));
     
-    int depth = 0;
-    int temp = target;
-    while (temp > 1) { depth++; temp /= 2; }
-
-    vector<int> final_chain;
-    
-    // 1. Run the Grind
-    while (true) {
-        vector<int> chain = {1};
-        if (search_general_chain(target, 0, depth, chain)) {
-            final_chain = chain;
-            break;
-        }
-        depth++;
+    while (best_chain.empty() && keep_running) {
+        vector<uint32_t> initial_chain = {1};
+        search_chain(target_n, 0, target_depth, initial_chain, best_chain);
+        if (best_chain.empty()) target_depth++;
     }
-
-    // 2. Mathematically Deduce the Parents
-    uint32_t parentA = 1;
-    uint32_t parentB = 1;
-    bool is_non_star = true;
-
-    if (final_chain.size() >= 2) {
-        uint32_t immediate_pred = final_chain[final_chain.size() - 2];
-        uint32_t needed_b = target - immediate_pred;
-
-        // Check if it's a standard Star Step
-        for (int x : final_chain) {
-            if (x == needed_b) {
-                parentA = immediate_pred;
-                parentB = needed_b;
-                is_non_star = false;
-                break;
-            }
-        }
-
-        // If not a star step, deep-search the chain for the rare parent combo
-        if (is_non_star) {
-            bool found = false;
-            for (int i = final_chain.size() - 2; i >= 0; --i) {
-                for (int j = i; j >= 0; --j) {
-                    if (final_chain[i] + final_chain[j] == target) {
-                        parentA = final_chain[i];
-                        parentB = final_chain[j];
-                        found = true;
-                        break;
-                    }
-                }
-                if (found) break;
-            }
-            if (!found) { // Safety fallback
-                parentA = immediate_pred;
-                parentB = target - immediate_pred;
-            }
-        }
-    }
-
-    // 3. Set the 4 Metadata Flags
-    uint8_t flags = 0;
-    if (parentA == parentB) flags |= (1 << 0); // Bit 0: Doubling
-    if (parentB == 1) flags |= (1 << 1);       // Bit 1: Small Step
-    if (is_prime_n(target)) flags |= (1 << 2); // Bit 2: Prime
-    if (is_non_star) flags |= (1 << 3);        // Bit 3: Non-Star Anomaly
-
-    // 4. Pack into 32-bit Architecture using the 22-bit Delta method
-    uint32_t delta = target - parentA;
-
-    // Hard Safety Check to ensure the delta never overflows 22 bits
-    if (delta > 0x3FFFFF) {
-        #pragma omp critical
-        cout << "\n[CRITICAL WARNING] 22-Bit Delta Overflow at N=" << target << "! Value corrupted." << endl;
-    }
-
-    // 6 bits (steps) | 4 bits (flags) | 22 bits (Delta)
-    uint8_t steps = (uint8_t)depth;
-    
-    // Steps takes 6 bits (0x3F), Flags shift by 6, Delta shifts by 10 (6+4)
-    uint32_t encoded = (steps & 0x3F) | ((flags & 0x0F) << 6) | ((delta & 0x3FFFFF) << 10);
-    
-    return { encoded };
+    return best_chain;
 }
 
 // ==========================================
-// 4. MAIN EXECUTION LOOP
+// 4. MAIN SLIDING WINDOW ENGINE
 // ==========================================
-int main(int argc, char* argv[]) {
+int main() {
+    signal(SIGINT, sig_handler);
     omp_set_num_threads(6); 
-
-    cout << "=========================================" << endl;
-    cout << " 32-BIT ATOMIC ENGINE STARTED            " << endl;
-    cout << " 22-BIT DELTA MODE | MAX LIMIT: 8,388,606" << endl;
-    cout << "=========================================" << endl;
     
-    vector<uint8_t> oeis_cache = load_oeis_cache();
-    
-    int current_n;
-    int end_limit = -1;
-    string active_file = LEDGER_FILE;
+    // Both buffers are raw bytes to ensure perfect Little-Endian packing
+    vector<uint8_t> buf_index;
+    vector<uint8_t> buf_blob;
 
-    // CLI ARGUMENT PARSING
-    if (argc == 3) {
-        int requested_start = stoi(argv[1]);
-        end_limit = stoi(argv[2]);
-        active_file = "chunk_" + to_string(requested_start) + "_" + to_string(end_limit) + ".bin";
+    uint32_t start_n = 2;
+    uint64_t current_blob_offset = 0;
+
+    // RESUME LOGIC (Fat Index is 12 bytes per N)
+    ifstream check_index(FILE_INDEX, ios::binary | ios::ate);
+    if (check_index.is_open()) {
+        start_n = check_index.tellg() / 12; 
+        check_index.close();
         
-        current_n = get_resume_target(active_file, requested_start);
-        
-        cout << "[DISTRIBUTED MODE] Target Range: " << requested_start << " to " << end_limit << endl;
-        cout << "[!] Saving isolated payload to: " << active_file << endl;
-        cout << "Resuming chunk at N = " << current_n << endl;
-        
+        ifstream check_blob(FILE_BLOB, ios::binary | ios::ate);
+        if (check_blob.is_open()) {
+            current_blob_offset = check_blob.tellg();
+            check_blob.close();
+        }
+        cout << "[RESUME] Starting at N=" << start_n << " | Blob Offset: " << current_blob_offset << endl;
     } else {
-        current_n = get_resume_target(active_file, 2);
-        cout << "[STANDARD MODE] Active Ledger: " << active_file << endl;
-        cout << "Resuming at N = " << current_n << "\nPress Ctrl+C at any time to safely stop." << endl;
+        cout << "[NEW RUN] Formatting Fat-Index Database..." << endl;
+        // Pad N=0 and N=1 with 24 blank bytes total (12 bytes each)
+        for(int i=0; i<24; i++) buf_index.push_back(0); 
     }
 
-    // Safety checks against the architectural limit
-    if (current_n > MAX_SUPPORTED_N) {
-        cout << "[ABORT] System has reached max 22-Bit Delta capacity (" << MAX_SUPPORTED_N << ")." << endl;
-        return 0;
-    }
-    if (end_limit != -1 && end_limit > MAX_SUPPORTED_N) {
-        cout << "[WARNING] End limit adjusted to safe architecture maximum: " << MAX_SUPPORTED_N << endl;
-        end_limit = MAX_SUPPORTED_N;
+    uint32_t last_processed_n = start_n - 1; 
+    auto batch_start = chrono::high_resolution_clock::now();
+
+    cout << "\n[SLIDING WINDOW MODE] 6 Cores Hunting Asynchronously..." << endl;
+
+    // THE SLIDING WINDOW: Out-of-order math, In-order loop resolution
+    #pragma omp parallel for ordered schedule(dynamic, 1)
+    for (uint32_t n = start_n; n <= RUN_LIMIT; ++n) {
+        
+        if (!keep_running) continue;
+
+        // ---------------------------------------------------------
+        // ASYNC PHASE: 6 Cores calculate at maximum speed
+        // ---------------------------------------------------------
+        vector<uint32_t> best_chain = solve_n(n);
+        uint16_t length = (uint16_t)(best_chain.size() - 1);
+        uint16_t flags = calculate_enrichment_mask(n, best_chain);
+
+        // ---------------------------------------------------------
+        // ORDERED PHASE: Strictly Sequential File Packing
+        // ---------------------------------------------------------
+        #pragma omp ordered
+        {
+            if (keep_running) {
+                last_processed_n = n; 
+
+                // 1. PACK FAT INDEX (12 Bytes)
+                // A. Offset (8 Bytes)
+                for (int b = 0; b < 8; ++b) buf_index.push_back((current_blob_offset >> (b * 8)) & 0xFF);
+                // B. Length (2 Bytes)
+                buf_index.push_back(length & 0xFF);
+                buf_index.push_back((length >> 8) & 0xFF);
+                // C. Flags (2 Bytes)
+                buf_index.push_back(flags & 0xFF);
+                buf_index.push_back((flags >> 8) & 0xFF);
+
+                // 2. PACK BLOB (Length Prefix + 32-bit Integers)
+                buf_blob.push_back(best_chain.size() & 0xFF);
+                buf_blob.push_back((best_chain.size() >> 8) & 0xFF);
+                current_blob_offset += 2;
+
+                for (uint32_t num : best_chain) {
+                    buf_blob.push_back(num & 0xFF);
+                    buf_blob.push_back((num >> 8) & 0xFF);
+                    buf_blob.push_back((num >> 16) & 0xFF);
+                    buf_blob.push_back((num >> 24) & 0xFF);
+                    current_blob_offset += 4;
+                }
+
+                // 3. CHUNK FLUSH SAFETY
+                if (n % FLUSH_CHUNK == 0 || n == RUN_LIMIT) {
+                    ofstream out_idx(FILE_INDEX, ios::binary | ios::app);
+                    out_idx.write(reinterpret_cast<const char*>(buf_index.data()), buf_index.size());
+                    out_idx.close();
+
+                    ofstream out_blob(FILE_BLOB, ios::binary | ios::app);
+                    out_blob.write(reinterpret_cast<const char*>(buf_blob.data()), buf_blob.size());
+                    out_blob.close();
+
+                    buf_index.clear(); 
+                    buf_blob.clear();
+                    
+                    auto batch_end = chrono::high_resolution_clock::now();
+                    chrono::duration<double> diff = batch_end - batch_start;
+                    
+                    cout << ">>> FLUSHED up to N=" << n 
+                         << " | Blob: " << current_blob_offset / 1024 << " KB"
+                         << " | Time: " << fixed << setprecision(2) << diff.count() << "s <<<" << endl;
+                         
+                    batch_start = chrono::high_resolution_clock::now(); 
+                }
+            }
+        }
     }
 
-    if (end_limit != -1 && current_n > end_limit) {
-        cout << "\n[COMPLETED] This chunk has already reached its target limit." << endl;
-        return 0;
+    // SAFE EXIT DUMP
+    if (!buf_index.empty()) {
+        ofstream out_idx(FILE_INDEX, ios::binary | ios::app);
+        out_idx.write(reinterpret_cast<const char*>(buf_index.data()), buf_index.size());
+        ofstream out_blob(FILE_BLOB, ios::binary | ios::app);
+        out_blob.write(reinterpret_cast<const char*>(buf_blob.data()), buf_blob.size());
     }
     
-    while (true) {
-        int chunk_size;
-        // Adjusted batch sizing to hit batches of 6 threads exactly when it gets hard
-        if (current_n < 20000) chunk_size = 100;
-        else if (current_n < 30000) chunk_size = 10;
-        else chunk_size = 6;
-
-        // Ensure we don't overshoot the end limit in Distributed Mode
-        if (end_limit != -1 && (current_n + chunk_size - 1) > end_limit) {
-            chunk_size = (end_limit - current_n) + 1;
-        }
-
-        // Ensure we don't overshoot the absolute architecture limit
-        if (current_n + chunk_size - 1 > MAX_SUPPORTED_N) {
-            chunk_size = (MAX_SUPPORTED_N - current_n) + 1;
-        }
-
-        int end_n = current_n + chunk_size - 1;
-        vector<PackedBlueprint> memory_buffer(chunk_size);
-
-        cout << "\nProcessing N=" << current_n << " to " << end_n << "..." << flush;
-        auto start = chrono::high_resolution_clock::now();
-
-        #pragma omp parallel for schedule(dynamic)
-        for (int i = 0; i < chunk_size; ++i) {
-            memory_buffer[i] = find_optimal_steps(current_n + i);
-        }
-
-        auto end = chrono::high_resolution_clock::now();
-        chrono::duration<double> elapsed = end - start;
-
-        // Atomic write to whichever file is active (master or chunk)
-        append_to_binary(memory_buffer, active_file);
-        
-        // Log and Verify against OEIS
-        verify_and_log(current_n, end_n, memory_buffer, elapsed.count(), oeis_cache);
-
-        cout << " Done in " << elapsed.count() << "s" << flush;
-        current_n += chunk_size;
-
-        // Stop the engine if we hit the chunk limit
-        if (end_limit != -1 && current_n > end_limit) {
-            cout << "\n\n[CHUNK COMPLETE] Node has successfully mapped " << argv[1] << " to " << end_limit << "." << endl;
-            break;
-        }
-        
-        // Final safety exit if ceiling is reached
-        if (current_n > MAX_SUPPORTED_N) {
-            cout << "\n\n[SYSTEM LIMIT REACHED] Reached N=" << MAX_SUPPORTED_N << ". Architecture limit reached." << endl;
-            break;
-        }
-    }
-
+    cout << "\n[SAFE EXIT] Engine halted cleanly at N=" << last_processed_n << endl;
     return 0;
 }
