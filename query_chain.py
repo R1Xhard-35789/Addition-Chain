@@ -2,90 +2,79 @@ import sys
 import struct
 import json
 import os
+import math
 
 def get_chain(target):
-    # Ensure this path matches where your new master_ledger.bin is located!
-    LEDGER_FILE = "/var/www/html/tools/master_ledger.bin" 
+    INDEX_FILE = "chain_index.bin"
+    BLOB_FILE  = "chain_blob.bin"
     
-    # Fallback for local testing if the absolute path fails
-    if not os.path.exists(LEDGER_FILE):
-        LEDGER_FILE = "master_ledger.bin" 
+    # Fallback for local testing if needed
+    if not os.path.exists(INDEX_FILE):
+        INDEX_FILE = "/var/www/html/tools/chain_index.bin"
+        BLOB_FILE  = "/var/www/html/tools/chain_blob.bin"
 
-    if not os.path.exists(LEDGER_FILE):
-        return {"error": "New 32-bit Database file (master_ledger.bin) missing."}
+    if not os.path.exists(INDEX_FILE) or not os.path.exists(BLOB_FILE):
+        return {"error": "Database files missing. Please run the C++ engine first."}
 
-    # File size divided by 4 gives the maximum indexed N
-    max_indexed = os.path.getsize(LEDGER_FILE) // 4 - 1
+    # Fat Index is 12 bytes per record. 
+    max_indexed = os.path.getsize(INDEX_FILE) // 12 - 1
     
     if target > max_indexed or target < 2:
-        return {"error": f"Target {target} exceeds registry limit ({max_indexed})."}
+        return {"error": f"Target {target} exceeds registry limit (Max: {max_indexed})."}
 
-    with open(LEDGER_FILE, "rb") as f:
-        # Seek exactly to N's 4-byte block
-        f.seek(target * 4)
-        raw_data = f.read(4)
-        
-        if len(raw_data) < 4:
-            return {"error": "Corrupted read."}
+    try:
+        # 1. READ THE FAT INDEX (12 bytes)
+        with open(INDEX_FILE, "rb") as f_idx:
+            f_idx.seek(target * 12)
+            index_data = f_idx.read(12)
             
-        encoded_32bit = struct.unpack("<I", raw_data)[0]
-        
-        # Unpack the 32-bit architecture
-        steps = encoded_32bit & 0x7F
-        flags = (encoded_32bit >> 7) & 0x0F
-        
-        # Decode Metadata Flags
-        is_doubling = bool(flags & (1 << 0))
-        is_small_step = bool(flags & (1 << 1))
-        is_prime = bool(flags & (1 << 2))
-        is_non_star = bool(flags & (1 << 3))
+            # Unpack: Q (uint64 offset), H (uint16 length), H (uint16 flags)
+            blob_offset, chain_length, flags = struct.unpack("<QHH", index_data)
 
-        # Reconstruct the sequence path by walking backwards
-        chain = []
-        current = target
-        while current > 1:
-            chain.append(str(current))
-            f.seek(current * 4)
-            prev_data = struct.unpack("<I", f.read(4))[0]
-            parentA = (prev_data >> 11) & 0x1FFFFF
-            
-            # [!] AUTO-HEAL: Kills the "Ghosting Bug" 
-            # If a parent is >= current, it's a migrated ghost. Break the loop.
-            if parentA >= current:
-                break
-                
-            current = parentA
-            
-        if "1" not in chain:
-            chain.append("1")
-            
-        chain.reverse() # Flip it to read 1 -> 2 -> 4 ... -> N
+        # 2. READ THE PURE BLOB
+        with open(BLOB_FILE, "rb") as f_blob:
+            f_blob.seek(blob_offset)
+            nodes_count = struct.unpack("<H", f_blob.read(2))[0]
+            chain_data = struct.unpack(f"<{nodes_count}I", f_blob.read(nodes_count * 4))
+            chain_str = " → ".join(map(str, chain_data))
 
-        # [!] VISUAL SANITIZER: Double-check to remove any side-by-side duplicates
-        deduped_chain = []
-        for x in chain:
-            if not deduped_chain or deduped_chain[-1] != x:
-                deduped_chain.append(x)
+        # 3. CALCULATE DEFECT
+        # Defect = Steps (chain_length) - log2(Target)
+        defect = chain_length - math.floor(math.log2(target))
 
-        return {
-            "target": target,
-            "optimal_steps": steps,
-            "synthesis": " → ".join(deduped_chain),
-            "registry_limit": max_indexed,
-            "metadata": {
-                "is_prime": is_prime,
-                "is_doubling": is_doubling,
-                "is_increment": is_small_step,
-                "is_non_star_anomaly": is_non_star
-            }
+        # 4. DECODE 16-BIT ENRICHMENT FLAGS (Fixed assignment here)
+        metadata = {
+            "is_prime": bool(flags & (1 << 0)),
+            "is_safe_prime": bool(flags & (1 << 1)),
+            "high_hamming": bool(flags & (1 << 2)),
+            "is_peak": bool(flags & (1 << 3)),
+            "is_fib_step": bool(flags & (1 << 4)),
+            "uses_factor": bool(flags & (1 << 5)),
+            "is_square": bool(flags & (1 << 6)),
+            "is_square_free": bool(flags & (1 << 7)),
+            "is_triangular": bool(flags & (1 << 8)),
+            "is_power_of_2": bool(flags & (1 << 9)),
+            "is_mersenne": bool(flags & (1 << 10)),
+            "is_palindrome": bool(flags & (1 << 11)),
+            "heavy_divisors": bool(flags & (1 << 12)),
+            "is_small_base": bool(flags & (1 << 13))
         }
 
+    except Exception as e:
+        return {"error": f"Database Read Error: {str(e)}"}
+
+    return {
+        "target": target,
+        "optimal_steps": chain_length,
+        "defect": defect,
+        "synthesis": chain_str,
+        "metadata": metadata,
+        "registry_limit": max_indexed
+    }
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        try:
-            target_n = int(sys.argv[1])
-            print(json.dumps(get_chain(target_n)))
-        except Exception as e:
-            print(json.dumps({"error": str(e)}))
-    else:
-        print(json.dumps({"error": "No target provided."}))
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "No target specified."}))
+        sys.exit(1)
+    target_val = int(sys.argv[1])
+    print(json.dumps(get_chain(target_val), indent=4))
